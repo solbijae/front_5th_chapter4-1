@@ -3,7 +3,7 @@ name: Deploy Next.js to S3 and invalidate CloudFront
 on:
   push:
     branches:
-      - main # 또는 master, 프로젝트의 기본 브랜치 이름에 맞게 조정
+      - main
   workflow_dispatch:
 
 jobs:
@@ -34,3 +34,72 @@ jobs:
       - name: Invalidate CloudFront cache
         run: |
           aws cloudfront create-invalidation --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} --paths "/*"
+
+  lighthouse:
+    needs: deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          npm install -g @lhci/cli
+
+      - name: Run Lighthouse CI
+        run: lhci collect --config=.lighthouserc.js
+
+      - name: Parse and upload to Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: |
+          for REPORT in .lighthouseci/lhr-*.json; do
+            URL=$(jq -r '.finalUrl' "$REPORT")
+            PERFORMANCE=$(jq '.categories.performance.score * 100' "$REPORT")
+            ACCESSIBILITY=$(jq '.categories.accessibility.score * 100' "$REPORT")
+            BEST=$(jq '.categories["best-practices"].score * 100' "$REPORT")
+            SEO=$(jq '.categories.seo.score * 100' "$REPORT")
+
+            JSON=$(jq -n \
+              --arg url "$URL" \
+              --arg date "$(date -I)" \
+              --argjson performance "$PERFORMANCE" \
+              --argjson accessibility "$ACCESSIBILITY" \
+              --argjson best "$BEST" \
+              --argjson seo "$SEO" \
+              '{
+                parent: { database_id: env.NOTION_DATABASE_ID },
+                properties: {
+                  "URL": { title: [{ text: { content: $url } }] },
+                  "날짜": { date: { start: $date } },
+                  "Performance": { number: $performance },
+                  "Accessibility": { number: $accessibility },
+                  "Best Practices": { number: $best },
+                  "SEO": { number: $seo }
+                }
+              }')
+
+            # curl 실행 + 응답 저장
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST https://api.notion.com/v1/pages \
+              -H "Authorization: Bearer $NOTION_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Notion-Version: 2022-06-28" \
+              --data "$JSON")
+
+            # HTTP 상태코드 분리
+            HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+            RESPONSE_BODY=$(echo "$RESPONSE" | head -n -1)
+
+            echo "HTTP status: $HTTP_STATUS"
+            echo "Response body: $RESPONSE_BODY"
+
+            # 상태코드 200 또는 201 아니면 실패 처리
+            if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
+              echo "Error: Notion API request failed"
+              echo "$RESPONSE_BODY"
+              exit 1
+            fi
+          done
